@@ -114,7 +114,7 @@ Then reload udev rules with `sudo udevadm control --reload-rules && sudo udevadm
 ### Configuration
 Bezel looks for its configuration at `~/.config/bezel/config.toml`.
 
-On first install, `install.sh` launches a terminal onboarding wizard. It detects your Wayland desktop, offers numbered choices for Hyprland, Niri, Sway, Plasma, GNOME, or other Wayland desktops, and shows each trackpad edge as you configure it. Each edge supports up, down, left, right, and tap, with 16 available actions on Hyprland, 15 on Niri and Sway, and 11 on other desktops. Press Enter to keep suggested bindings, or customize any of the 20 edge/gesture slots. Hyprland, Niri, and Sway get their own workspace commands; Plasma, GNOME, and unknown desktops omit workspace actions. On upgrades, the installer asks whether to run onboarding again when a config exists. Choosing no keeps the config. Choosing yes opens the wizard, where **Apply now** backs up and replaces it, while **Save preview only** leaves it unchanged.
+On first install, `install.sh` launches a terminal onboarding wizard. It detects your Wayland desktop, offers numbered choices for Hyprland, Niri, Sway, Plasma, GNOME, other Wayland desktops, or NixOS, and shows each trackpad edge as you configure it. In the panel, customizing an edge lets you choose 1–4 fingers, then a gesture and action, with up to 30 action presets plus custom shell commands. Window controls adapt to Hyprland, Niri, and Sway; utility presets appear when their required tools are installed. Press Enter to keep suggested bindings, or customize each edge, including multi-finger bindings. Hyprland, Niri, and Sway get their own workspace commands; Plasma, GNOME, and unknown desktops omit workspace actions. On upgrades, the installer asks whether to run onboarding again when a config exists. Choosing no keeps the config. Choosing yes opens the wizard, where **Apply now** backs up and replaces it, while **Save preview only** leaves it unchanged.
 
 The active trackpad edge uses a static warm-orange halo in color terminals. If your shell sets `NO_COLOR`, run `bash onboard.sh --color` to preview the accent anyway; `--no-color` forces the monochrome version.
 
@@ -141,6 +141,46 @@ canonical_hints = false # Set to true only if using mako or notify-osd
 ```
 
 **NixOS Users:** After importing the Home Manager module you can also customize Bezel using the `services.bezel.config` option. See `config.nix.example` for a complete template.
+
+### Multi-finger gestures
+
+Legacy `[gestures.edge.direction]` entries bind one finger. Use `[[bindings]]` for **1–4 fingers**, with `zone`, `fingers`, `gesture`, `action = "command"`, and `cmd`:
+
+```toml
+[[bindings]]
+zone = "left"
+fingers = 2
+gesture = "slide_up"
+action = "command"
+cmd = "wpctl set-volume @DEFAULT_SINK@ 2%+"
+step_distance = 0.03
+```
+
+Start one finger at an edge, then add the others within **80 ms** (`join_ms`); they may start inside the pad. Existing center touches stay independent. One edge gesture runs at a time, and contacts arriving after the joining window pass through normally. The selected edge and finger count remain fixed until release. Unconfigured counts do not fall back to one-finger commands; gesture contacts remain reserved until lifted. More than four joining contacts cancel the gesture. Your trackpad must report each contact independently using multitouch slots.
+
+Available gestures:
+
+- `tap`, `double_tap`, `hold`.
+- `swipe_up`, `swipe_down`, `swipe_left`, `swipe_right`, and `swipe_up_left`, `swipe_up_right`, `swipe_down_left`, `swipe_down_right`.
+- `slide_up`, `slide_down`, `slide_left`, `slide_right`: repeat the command for each movement step, with direction reversal supported.
+
+Swipes fire once when all participating fingers lift. Holds fire once while fingers remain down. Slides and holds suppress release gestures. Diagonal bindings apply within 22.5° of their diagonal; otherwise Bezel uses the dominant cardinal direction. Single taps are delayed only when a double tap is bound for the same edge/count; both taps must finish within the double-tap interval and start close together.
+
+Set shared defaults in `[recognition]`. Distances are fractions of the trackpad axes, not physical millimeters:
+
+| Setting | Default | Per-binding override |
+| --- | --- | --- |
+| `join_ms` | 80 | Shared only |
+| `swipe_distance` | 0.05 | Swipes |
+| `tap_distance` | 0.02 | Taps and holds |
+| `tap_ms` | 200 | Taps and double taps |
+| `double_tap_ms` | 300 | Double taps |
+| `hold_ms` | 500 | Holds |
+| `step_distance` | 0.03 | Slides |
+
+Distances accept 0.001–1; times accept 1–10000 ms (`join_ms`: 1–1000), with joining time no greater than tap/hold time. Explicit bindings override equivalent legacy entries; duplicate explicit bindings and incompatible overrides are rejected. Valid config reloads affect the next gesture; invalid reloads retain the previous configuration.
+
+Run `bash onboard.sh` and choose **Customize this edge → finger count → gesture → action**. You can assign one-finger volume and two-finger brightness on the same edge. The plain fallback also provides a separate advanced binding editor. It supports 30 action presets, custom shell commands (option 31), shared sensitivity, and TOML or Nix output. New presets include close/fullscreen/floating, directional window focus, launcher, terminal, lock, screenshots, clipboard history, and Do Not Disturb. Utility choices detect installed tools: fuzzel/wofi/rofi, common terminals, hyprlock/swaylock/loginctl, grim + slurp + wl-copy (or Niri screenshots), cliphist + a picker + wl-copy, and swaync/dunst. Clipboard history requires an existing cliphist capture service; screenshots from grim are copied to the clipboard. Nix users should add the tools they select to their packages. Preview, backup, and cancel work as before. See [config.toml.example](config.toml.example) and [config.nix.example](config.nix.example).
 
 ### Autostart
 

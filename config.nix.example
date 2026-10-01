@@ -21,6 +21,14 @@ in
       bottom_height = 0.08;
     };
 
+    # Optional: shared defaults and explicit finger-count bindings.
+    # recognition = { join_ms = 80; hold_ms = 500; step_distance = 0.03; };
+    # bindings = [
+    #   ((mkCmd "${pkgs.wireplumber}/bin/wpctl set-volume @DEFAULT_SINK@ 2%+") // {
+    #     zone = "left"; fingers = 2; gesture = "slide_up"; step_distance = 0.03;
+    #   })
+    # ];
+
     gestures = {
       # ---- Left Zone Gestures ----
       left = {

@@ -1,29 +1,17 @@
-use anyhow::{bail, Context, Result};
-use evdev::{AbsoluteAxisType, Device, InputEvent, InputEventKind};
-use std::time::Instant;
-use tracing::{debug, error, info};
+use anyhow::{bail, ensure, Context, Result};
+use evdev::{
+    raw_stream::RawDevice, AbsoluteAxisType as Axis, EventType, InputEvent, InputEventKind, Key,
+    Synchronization,
+};
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+use tracing::{error, info};
 
 use crate::config::Config;
-use crate::gesture::{classify_gesture, GestureEvent, Zone};
+use crate::gesture::{Contact, GestureEvent, Recognizer};
 use crate::passthrough::create_virtual_device;
 
-const SLOT_COUNT: usize = 10;
-
-#[derive(Debug, Clone, Default)]
-pub struct SlotState {
-    pub active: bool,
-    pub claimed: bool,
-    pub tracking_id: i32,
-    pub start_x: Option<f32>,
-    pub start_y: Option<f32>,
-    pub current_x: f32,
-    pub current_y: f32,
-    pub start_time: Option<Instant>,
-    pub assigned_zone: Option<Zone>,
-    pub needs_zone_check: bool,
-}
-
-pub fn find_trackpad() -> Result<Device> {
+pub fn find_trackpad() -> Result<RawDevice> {
     for entry in std::fs::read_dir("/dev/input").context("Failed to read /dev/input")? {
         let entry = entry?;
         let path = entry.path();
@@ -31,12 +19,12 @@ pub fn find_trackpad() -> Result<Device> {
             continue;
         }
 
-        if let Ok(device) = Device::open(&path) {
+        if let Ok(device) = RawDevice::open(&path) {
             if let Some(abs_axes) = device.supported_absolute_axes() {
-                if abs_axes.contains(AbsoluteAxisType::ABS_X)
-                    && abs_axes.contains(AbsoluteAxisType::ABS_Y)
-                    && abs_axes.contains(AbsoluteAxisType::ABS_MT_POSITION_X)
-                    && abs_axes.contains(AbsoluteAxisType::ABS_MT_POSITION_Y)
+                if abs_axes.contains(Axis::ABS_X)
+                    && abs_axes.contains(Axis::ABS_Y)
+                    && abs_axes.contains(Axis::ABS_MT_POSITION_X)
+                    && abs_axes.contains(Axis::ABS_MT_POSITION_Y)
                 {
                     info!(
                         "Found trackpad automatically: {} at {:?}",
@@ -51,391 +39,479 @@ pub fn find_trackpad() -> Result<Device> {
     bail!("No trackpad device found automatically. Check your /dev/input/ permissions.");
 }
 
-fn determine_zone(norm_x: f32, norm_y: f32, config: &Config) -> Option<Zone> {
-    if norm_x < config.zones.left_width {
-        Some(Zone::Left)
-    } else if norm_x > 1.0 - config.zones.right_width {
-        Some(Zone::Right)
-    } else if norm_y < config.zones.top_height {
-        Some(Zone::Top)
-    } else if norm_y > 1.0 - config.zones.bottom_height {
-        Some(Zone::Bottom)
-    } else {
-        None
-    }
+#[derive(Clone, Default)]
+struct Slot {
+    id: Option<i32>,
+    axes: BTreeMap<u16, i32>,
 }
 
-/// Key codes for BTN_TOOL_* events used in single-touch synthesis.
-const BTN_TOUCH: u16 = 0x14a;
-const BTN_TOOL_FINGER: u16 = 0x145;
-const BTN_TOOL_DOUBLETAP: u16 = 0x14d;
-const BTN_TOOL_TRIPLETAP: u16 = 0x14e;
-const BTN_TOOL_QUADTAP: u16 = 0x14f;
-const BTN_TOOL_QUINTTAP: u16 = 0x148;
-
-/// Event types/codes we need to filter and synthesize.
-fn is_single_touch_emulation(ev: &InputEvent) -> bool {
-    match ev.kind() {
-        InputEventKind::AbsAxis(AbsoluteAxisType::ABS_X) => true,
-        InputEventKind::AbsAxis(AbsoluteAxisType::ABS_Y) => true,
-        InputEventKind::Key(key) => {
-            let code = key.code();
-            code == BTN_TOUCH
-                || code == BTN_TOOL_FINGER
-                || code == BTN_TOOL_DOUBLETAP
-                || code == BTN_TOOL_TRIPLETAP
-                || code == BTN_TOOL_QUADTAP
-                || code == BTN_TOOL_QUINTTAP
-        }
-        _ => false,
-    }
+struct InputState {
+    slots: Vec<Slot>,
+    forwarded: Vec<Slot>,
+    current: usize,
+    bounds: (f32, f32, f32, f32),
+    recognizer: Recognizer,
 }
 
-/// Returns the BTN_TOOL_* code for a given finger count, if any.
-fn btn_tool_for_count(count: u8) -> Option<u16> {
+fn abs(axis: Axis, value: i32) -> InputEvent {
+    InputEvent::new(EventType::ABSOLUTE, axis.0, value)
+}
+fn key(code: Key, value: i32) -> InputEvent {
+    InputEvent::new(EventType::KEY, code.0, value)
+}
+fn tool(count: usize) -> Option<Key> {
     match count {
-        1 => Some(BTN_TOOL_FINGER),
-        2 => Some(BTN_TOOL_DOUBLETAP),
-        3 => Some(BTN_TOOL_TRIPLETAP),
-        4 => Some(BTN_TOOL_QUADTAP),
-        5 => Some(BTN_TOOL_QUINTTAP),
+        1 => Some(Key::BTN_TOOL_FINGER),
+        2 => Some(Key::BTN_TOOL_DOUBLETAP),
+        3 => Some(Key::BTN_TOOL_TRIPLETAP),
+        4 => Some(Key::BTN_TOOL_QUADTAP),
+        5.. => Some(Key::BTN_TOOL_QUINTTAP),
         _ => None,
     }
 }
-
-/// Find the lowest-numbered active, unclaimed slot to use as the primary
-/// source for ABS_X/ABS_Y single-touch coordinates.
-fn find_primary_unclaimed(slots: &[SlotState; SLOT_COUNT]) -> Option<usize> {
-    (0..SLOT_COUNT).find(|&i| slots[i].active && !slots[i].claimed)
+fn mt(axis: Axis) -> bool {
+    (0x2f..=0x3f).contains(&axis.0)
+}
+fn emulated(ev: &InputEvent) -> bool {
+    matches!(
+        ev.kind(),
+        InputEventKind::AbsAxis(
+            Axis::ABS_X | Axis::ABS_Y | Axis::ABS_PRESSURE | Axis::ABS_TOOL_WIDTH
+        ) | InputEventKind::Key(
+            Key::BTN_TOUCH
+                | Key::BTN_TOOL_FINGER
+                | Key::BTN_TOOL_DOUBLETAP
+                | Key::BTN_TOOL_TRIPLETAP
+                | Key::BTN_TOOL_QUADTAP
+                | Key::BTN_TOOL_QUINTTAP
+        )
+    )
 }
 
-/// Count unclaimed (active and not claimed) fingers.
-fn count_unclaimed(slots: &[SlotState; SLOT_COUNT]) -> u8 {
-    slots.iter().filter(|s| s.active && !s.claimed).count() as u8
+impl InputState {
+    fn new(count: usize, bounds: (f32, f32, f32, f32)) -> Self {
+        Self {
+            slots: vec![Slot::default(); count],
+            forwarded: vec![Slot::default(); count],
+            current: 0,
+            bounds,
+            recognizer: Recognizer::default(),
+        }
+    }
+    fn contact(&self, slot: &Slot, active: bool) -> Option<Contact> {
+        let (xmin, xrange, ymin, yrange) = self.bounds;
+        Some(Contact {
+            id: slot.id?,
+            x: (*slot.axes.get(&Axis::ABS_MT_POSITION_X.0)? as f32 - xmin) / xrange,
+            y: (*slot.axes.get(&Axis::ABS_MT_POSITION_Y.0)? as f32 - ymin) / yrange,
+            active,
+        })
+    }
+    fn contacts(&self) -> Vec<Contact> {
+        self.slots
+            .iter()
+            .filter_map(|s| self.contact(s, true))
+            .collect()
+    }
+    fn tick(&mut self, now: u64, config: &Config) -> Vec<GestureEvent> {
+        self.recognizer.update(&self.contacts(), now, config)
+    }
+    fn frame(
+        &mut self,
+        events: &[InputEvent],
+        now: u64,
+        config: &Config,
+    ) -> (Vec<InputEvent>, Vec<GestureEvent>) {
+        let mut output = Vec::new();
+        let mut ended = Vec::new();
+        for ev in events {
+            match ev.kind() {
+                InputEventKind::AbsAxis(Axis::ABS_MT_SLOT) => self.current = ev.value() as usize,
+                InputEventKind::AbsAxis(axis) if mt(axis) => {
+                    if self.current >= self.slots.len() {
+                        continue;
+                    }
+                    if axis == Axis::ABS_MT_TRACKING_ID {
+                        if let Some(contact) = self.contact(&self.slots[self.current], false) {
+                            ended.push(contact);
+                        }
+                        self.slots[self.current].id = (ev.value() >= 0).then_some(ev.value());
+                    } else {
+                        self.slots[self.current].axes.insert(axis.0, ev.value());
+                    }
+                }
+                _ if emulated(ev) => {}
+                InputEventKind::Synchronization(_) => {}
+                _ => output.push(*ev),
+            }
+        }
+        let mut contacts = self.contacts();
+        contacts.extend(ended);
+        let gestures = self.recognizer.update(&contacts, now, config);
+        output.extend(self.forward());
+        (output, gestures)
+    }
+    fn forward(&mut self) -> Vec<InputEvent> {
+        let mut output = Vec::new();
+        let old_count = self.forwarded.iter().filter(|s| s.id.is_some()).count();
+        for (index, slot) in self.slots.iter().enumerate() {
+            let visible = slot
+                .id
+                .filter(|id| !self.recognizer.claimed(*id) && self.contact(slot, true).is_some());
+            let old = &mut self.forwarded[index];
+            let mut updates = Vec::new();
+            if old.id != visible {
+                if old.id.is_some() {
+                    updates.push(abs(Axis::ABS_MT_TRACKING_ID, -1));
+                }
+                if let Some(id) = visible {
+                    updates.push(abs(Axis::ABS_MT_TRACKING_ID, id));
+                }
+            }
+            if visible.is_some() {
+                for (&axis, &value) in &slot.axes {
+                    if old.id != visible || old.axes.get(&axis) != Some(&value) {
+                        updates.push(InputEvent::new(EventType::ABSOLUTE, axis, value));
+                    }
+                }
+            }
+            if !updates.is_empty() {
+                output.push(abs(Axis::ABS_MT_SLOT, index as i32));
+                output.extend(updates);
+            }
+            *old = Slot {
+                id: visible,
+                axes: slot.axes.clone(),
+            };
+        }
+        let count = self.forwarded.iter().filter(|s| s.id.is_some()).count();
+        if (count > 0) != (old_count > 0) {
+            output.push(key(Key::BTN_TOUCH, i32::from(count > 0)));
+        }
+        if tool(count) != tool(old_count) {
+            if let Some(code) = tool(old_count) {
+                output.push(key(code, 0));
+            }
+            if let Some(code) = tool(count) {
+                output.push(key(code, 1));
+            }
+        }
+        if let Some(primary) = self.forwarded.iter().find(|s| s.id.is_some()) {
+            for (from, to) in [
+                (Axis::ABS_MT_POSITION_X, Axis::ABS_X),
+                (Axis::ABS_MT_POSITION_Y, Axis::ABS_Y),
+                (Axis::ABS_MT_PRESSURE, Axis::ABS_PRESSURE),
+                (Axis::ABS_MT_TOUCH_MAJOR, Axis::ABS_TOOL_WIDTH),
+            ] {
+                if let Some(&value) = primary.axes.get(&from.0) {
+                    output.push(abs(to, value));
+                }
+            }
+        } else if old_count > 0 {
+            output.push(abs(Axis::ABS_PRESSURE, 0));
+        }
+        output
+    }
+    fn reset(&mut self) -> Vec<InputEvent> {
+        self.recognizer.reset();
+        for slot in &mut self.slots {
+            slot.id = None;
+        }
+        self.forward()
+    }
 }
 
 pub async fn run_input_reader(
     config_rx: tokio::sync::watch::Receiver<Config>,
     gesture_tx: tokio::sync::mpsc::Sender<GestureEvent>,
 ) -> Result<()> {
-    // Initial config for device setup
     let config = config_rx.borrow().clone();
-
     let mut device = if config.device.path == "auto" {
         find_trackpad()?
     } else {
-        Device::open(&config.device.path)
-            .with_context(|| format!("Failed to open device at {}", config.device.path))?
+        RawDevice::open(&config.device.path)
+            .with_context(|| format!("Failed to open {}", config.device.path))?
     };
-
-    if let Err(e) = device.grab() {
-        error!("Failed to grab device exclusively. Ensure you have permissions or the device isn't grabbed by another process.");
-        error!("Hint: Add yourself to the `input` group and ensure correct udev rules are set.");
-        return Err(e.into());
-    }
-    info!("Successfully grabbed device.");
-
-    let mut virtual_device = create_virtual_device(&device)?;
-
-    let abs_state = device.get_abs_state().context("Failed to get abs state")?;
-    let x_info = abs_state[AbsoluteAxisType::ABS_MT_POSITION_X.0 as usize];
-    let y_info = abs_state[AbsoluteAxisType::ABS_MT_POSITION_Y.0 as usize];
-
-    let x_min = x_info.minimum as f32;
-    let x_max = x_info.maximum as f32;
-    let x_range = x_max - x_min;
-
-    let y_min = y_info.minimum as f32;
-    let y_max = y_info.maximum as f32;
-    let y_range = y_max - y_min;
-
-    info!(
-        "Trackpad bounds: X({} - {}), Y({} - {})",
-        x_min, x_max, y_min, y_max
+    let axes = device.get_abs_state()?;
+    let x = axes[Axis::ABS_MT_POSITION_X.0 as usize];
+    let y = axes[Axis::ABS_MT_POSITION_Y.0 as usize];
+    let slot = axes[Axis::ABS_MT_SLOT.0 as usize];
+    ensure!(
+        x.maximum > x.minimum && y.maximum > y.minimum,
+        "Trackpad has invalid coordinate bounds"
     );
-
-    // We will spawn a blocking task to read from the device since fetch_events is blocking.
-    tokio::task::spawn_blocking(move || {
-        let mut slots: [SlotState; SLOT_COUNT] = Default::default();
-        let mut current_slot: usize = 0;
-        let mut active_fingers: u8 = 0;
-
-        let mut prev_unclaimed_count: u8 = 0;
-        let mut prev_btn_touch: bool = false;
-
-        let mut frame_events: Vec<InputEvent> = Vec::with_capacity(64);
-
-        loop {
-            match device.fetch_events() {
-                Ok(events) => {
-                    for ev in events {
-                        if ev.kind()
-                            == InputEventKind::Synchronization(evdev::Synchronization::SYN_DROPPED)
-                        {
-                            error!("evdev buffer overflow (SYN_DROPPED). Resetting tracking state to prevent freeze.");
-                            slots = Default::default();
-                            active_fingers = 0;
-                            frame_events.clear();
-
-                            // Send a quick reset to the virtual device to release any stuck touches
-                            if prev_btn_touch {
-                                let mut output_events = Vec::new();
-                                if let Some(old_code) = btn_tool_for_count(prev_unclaimed_count) {
-                                    output_events.push(InputEvent::new(
-                                        evdev::EventType::KEY,
-                                        old_code,
-                                        0,
-                                    ));
-                                }
-                                output_events.push(InputEvent::new(
-                                    evdev::EventType::KEY,
-                                    BTN_TOUCH,
-                                    0,
-                                ));
-                                output_events.push(InputEvent::new(
-                                    evdev::EventType::SYNCHRONIZATION,
-                                    evdev::Synchronization::SYN_REPORT.0,
-                                    0,
-                                ));
-                                if let Err(e) = virtual_device.emit(&output_events) {
-                                    error!("Failed to recover virtual device: {}", e);
-                                }
-                                prev_btn_touch = false;
-                                prev_unclaimed_count = 0;
-                            }
-                            continue;
-                        }
-
-                        if ev.kind()
-                            == InputEventKind::Synchronization(evdev::Synchronization::SYN_REPORT)
-                        {
-                            let entry_slot = current_slot;
-                            let mut frame_slot = current_slot;
-
-                            for fev in &frame_events {
-                                match fev.kind() {
-                                    InputEventKind::AbsAxis(AbsoluteAxisType::ABS_MT_SLOT) => {
-                                        frame_slot = fev.value() as usize;
-                                        if frame_slot >= SLOT_COUNT {
-                                            frame_slot = SLOT_COUNT - 1;
-                                        }
-                                    }
-                                    InputEventKind::AbsAxis(
-                                        AbsoluteAxisType::ABS_MT_TRACKING_ID,
-                                    ) => {
-                                        if fev.value() == -1 {
-                                            if slots[frame_slot].active {
-                                                debug!(
-                                                    "Touch released in slot {} (claimed: {}, zone: {:?})",
-                                                    frame_slot, slots[frame_slot].claimed, slots[frame_slot].assigned_zone
-                                                );
-                                                if slots[frame_slot].claimed {
-                                                    let s = &slots[frame_slot];
-                                                    if let (Some(sx), Some(sy)) = (s.start_x, s.start_y) {
-                                                        let norm_dx = (s.current_x - sx) / x_range;
-                                                        let norm_dy = (s.current_y - sy) / y_range;
-                                                        let duration = s.start_time
-                                                            .unwrap_or_else(|| Instant::now())
-                                                            .elapsed()
-                                                            .as_millis();
-
-                                                        if let Some(zone) = s.assigned_zone {
-                                                            if let Some(gesture) = classify_gesture(
-                                                                zone, norm_dx, norm_dy,
-                                                                active_fingers, duration,
-                                                            ) {
-                                                                let _ = gesture_tx.blocking_send(gesture);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                slots[frame_slot].active = false;
-                                                if active_fingers > 0 {
-                                                    active_fingers -= 1;
-                                                }
-                                            }
-                                        } else {
-                                            if slots[frame_slot].active {
-                                                debug!(
-                                                    "Implicit touch release in slot {} (new tracking id {})",
-                                                    frame_slot, fev.value()
-                                                );
-                                                if active_fingers > 0 {
-                                                    active_fingers -= 1;
-                                                }
-                                            }
-                                            slots[frame_slot] = Default::default();
-                                            slots[frame_slot].active = true;
-                                            slots[frame_slot].claimed = false;
-                                            slots[frame_slot].tracking_id = fev.value();
-                                            slots[frame_slot].start_time = Some(Instant::now());
-                                            slots[frame_slot].needs_zone_check = true;
-                                            debug!(
-                                                "Touch started in slot {} with tracking id {}",
-                                                frame_slot,
-                                                fev.value()
-                                            );
-                                            active_fingers += 1;
-                                        }
-                                    }
-                                    InputEventKind::AbsAxis(
-                                        AbsoluteAxisType::ABS_MT_POSITION_X,
-                                    ) => {
-                                        let val = fev.value() as f32;
-                                        slots[frame_slot].current_x = val;
-                                        if slots[frame_slot].start_x.is_none() {
-                                            slots[frame_slot].start_x = Some(val);
-                                            debug!(
-                                                "Slot {} start_x initialized to {}",
-                                                frame_slot, val
-                                            );
-                                        }
-                                    }
-                                    InputEventKind::AbsAxis(
-                                        AbsoluteAxisType::ABS_MT_POSITION_Y,
-                                    ) => {
-                                        let val = fev.value() as f32;
-                                        slots[frame_slot].current_y = val;
-                                        if slots[frame_slot].start_y.is_none() {
-                                            slots[frame_slot].start_y = Some(val);
-                                            debug!(
-                                                "Slot {} start_y initialized to {}",
-                                                frame_slot, val
-                                            );
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-
-                            for i in 0..SLOT_COUNT {
-                                if slots[i].active && slots[i].needs_zone_check {
-                                    if let (Some(sx), Some(sy)) =
-                                        (slots[i].start_x, slots[i].start_y)
-                                    {
-                                        let norm_x = (sx - x_min) / x_range;
-                                        let norm_y = (sy - y_min) / y_range;
-
-                                        let current_config = config_rx.borrow().clone();
-                                        if let Some(zone) =
-                                            determine_zone(norm_x, norm_y, &current_config)
-                                        {
-                                            slots[i].claimed = true;
-                                            slots[i].assigned_zone = Some(zone);
-                                            debug!(
-                                                "Touch in slot {} claimed in zone {:?}",
-                                                i, zone
-                                            );
-                                        }
-                                        slots[i].needs_zone_check = false;
-                                    }
-                                }
-                            }
-
-                            current_slot = frame_slot;
-
-                            let mut output_events: Vec<InputEvent> = Vec::new();
-
-                            let mut filter_slot: usize = entry_slot;
-
-                            let mut pending_slot_event: Option<InputEvent> = None;
-
-                            for fev in &frame_events {
-                                match fev.kind() {
-                                    InputEventKind::AbsAxis(AbsoluteAxisType::ABS_MT_SLOT) => {
-                                        filter_slot = (fev.value() as usize).min(SLOT_COUNT - 1);
-                                        pending_slot_event = Some(*fev);
-                                    }
-                                    _ if is_single_touch_emulation(fev) => {}
-                                    InputEventKind::AbsAxis(axis) if is_mt_axis(axis) => {
-                                        if !slots[filter_slot].claimed {
-                                            if let Some(slot_ev) = pending_slot_event.take() {
-                                                output_events.push(slot_ev);
-                                            }
-                                            output_events.push(*fev);
-                                        }
-                                    }
-                                    _ => {
-                                        output_events.push(*fev);
-                                    }
-                                }
-                            }
-
-                            let unclaimed_count = count_unclaimed(&slots);
-                            let primary = find_primary_unclaimed(&slots);
-
-                            let btn_touch_now = unclaimed_count > 0;
-                            if btn_touch_now != prev_btn_touch {
-                                output_events.push(InputEvent::new(
-                                    evdev::EventType::KEY,
-                                    BTN_TOUCH,
-                                    if btn_touch_now { 1 } else { 0 },
-                                ));
-                                prev_btn_touch = btn_touch_now;
-                            }
-
-                            if unclaimed_count != prev_unclaimed_count {
-                                if let Some(old_code) = btn_tool_for_count(prev_unclaimed_count) {
-                                    output_events.push(InputEvent::new(
-                                        evdev::EventType::KEY,
-                                        old_code,
-                                        0,
-                                    ));
-                                }
-                                if let Some(new_code) = btn_tool_for_count(unclaimed_count) {
-                                    output_events.push(InputEvent::new(
-                                        evdev::EventType::KEY,
-                                        new_code,
-                                        1,
-                                    ));
-                                }
-                                prev_unclaimed_count = unclaimed_count;
-                            }
-
-                            if let Some(p) = primary {
-                                output_events.push(InputEvent::new(
-                                    evdev::EventType::ABSOLUTE,
-                                    AbsoluteAxisType::ABS_X.0,
-                                    slots[p].current_x as i32,
-                                ));
-                                output_events.push(InputEvent::new(
-                                    evdev::EventType::ABSOLUTE,
-                                    AbsoluteAxisType::ABS_Y.0,
-                                    slots[p].current_y as i32,
-                                ));
-                            }
-
-                            if !output_events.is_empty() {
-                                output_events.push(InputEvent::new(
-                                    evdev::EventType::SYNCHRONIZATION,
-                                    evdev::Synchronization::SYN_REPORT.0,
-                                    0,
-                                ));
-                                if let Err(e) = virtual_device.emit(&output_events) {
-                                    error!("Failed to write to virtual device: {}", e);
-                                }
-                            }
-
-                            frame_events.clear();
-                        } else {
-                            frame_events.push(ev);
-                        }
+    ensure!(
+        device
+            .supported_absolute_axes()
+            .is_some_and(|a| a.contains(Axis::ABS_MT_SLOT))
+            && slot.minimum == 0
+            && (0..256).contains(&slot.maximum),
+        "Trackpad must support type-B multitouch slots"
+    );
+    device
+        .grab()
+        .context("Failed to grab trackpad; check permissions and whether another daemon owns it")?;
+    let mut virtual_device = create_virtual_device(&device)?;
+    let mut state = InputState::new(
+        slot.maximum as usize + 1,
+        (
+            x.minimum as f32,
+            (x.maximum - x.minimum) as f32,
+            y.minimum as f32,
+            (y.maximum - y.minimum) as f32,
+        ),
+    );
+    state.current = slot.value as usize;
+    let mut recovering = device.get_key_state()?.contains(Key::BTN_TOUCH);
+    let supported_axes = device
+        .supported_absolute_axes()
+        .map(|axes| axes.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut stream = device.into_event_stream()?;
+    let mut frame = Vec::new();
+    let clock = Instant::now();
+    let mut timer = tokio::time::interval(Duration::from_millis(5));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    info!(
+        "Input reader ready ({} multitouch slots)",
+        state.slots.len()
+    );
+    loop {
+        let mut output = Vec::new();
+        let gestures;
+        tokio::select! {
+            event = stream.next_event() => {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(e) => {
+                        output.extend(state.reset());
+                        output.push(InputEvent::new(EventType::SYNCHRONIZATION, Synchronization::SYN_REPORT.0, 0));
+                        let _ = virtual_device.emit(&output);
+                        return Err(e).context("Trackpad disconnected");
                     }
-                }
-                Err(e) => {
-                    error!("Error reading events: {}. Device might be disconnected.", e);
-                    break;
+                };
+                match event.kind() {
+                    InputEventKind::Synchronization(Synchronization::SYN_DROPPED) => {
+                        error!("Input overflow; cancelling gestures and waiting for fingers to lift");
+                        output = state.reset(); frame.clear(); recovering = true; gestures = Vec::new();
+                    }
+                    InputEventKind::Synchronization(Synchronization::SYN_REPORT) => {
+                        if recovering {
+                            if !stream.device().get_key_state()?.contains(Key::BTN_TOUCH) {
+                                recovering = false;
+                                state.current = stream.device().get_abs_state()?[Axis::ABS_MT_SLOT.0 as usize].value as usize;
+                                for slot in &mut state.slots { slot.axes.clear(); }
+                            }
+                            frame.clear(); continue;
+                        }
+                        (output, gestures) = state.frame(&frame, clock.elapsed().as_millis() as u64, &config_rx.borrow());
+                        frame.clear();
+                    }
+                    _ => { if !recovering { frame.push(event); } continue; }
                 }
             }
+            _ = timer.tick() => {
+                if recovering || !frame.is_empty() { continue; }
+                gestures = state.tick(clock.elapsed().as_millis() as u64, &config_rx.borrow());
+            }
         }
-    });
-
-    Ok(())
+        output.retain(|ev| match ev.kind() {
+            InputEventKind::AbsAxis(axis) => supported_axes.contains(&axis),
+            _ => true,
+        });
+        if !output.is_empty() {
+            output.push(InputEvent::new(
+                EventType::SYNCHRONIZATION,
+                Synchronization::SYN_REPORT.0,
+                0,
+            ));
+            virtual_device
+                .emit(&output)
+                .context("Failed to forward trackpad input")?;
+        }
+        for gesture in gestures {
+            // Input forwarding must not wait on a slow command consumer.
+            if let Err(e) = gesture_tx.try_send(gesture) {
+                error!("Gesture queue full or closed: {}", e);
+            }
+        }
+    }
 }
 
-/// Returns true if the given absolute axis is a multitouch (ABS_MT_*) axis.
-fn is_mt_axis(axis: AbsoluteAxisType) -> bool {
-    // MT axes are in the range 0x2f..=0x3f (ABS_MT_SLOT through ABS_MT_TOOL_Y).
-    let code = axis.0;
-    (0x2f..=0x3f).contains(&code)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gesture::Gesture;
+    fn start(slot: i32, id: i32, x: i32, y: i32) -> Vec<InputEvent> {
+        vec![
+            abs(Axis::ABS_MT_SLOT, slot),
+            abs(Axis::ABS_MT_TRACKING_ID, id),
+            abs(Axis::ABS_MT_POSITION_X, x),
+            abs(Axis::ABS_MT_POSITION_Y, y),
+        ]
+    }
+    fn release(slot: i32) -> Vec<InputEvent> {
+        vec![
+            abs(Axis::ABS_MT_SLOT, slot),
+            abs(Axis::ABS_MT_TRACKING_ID, -1),
+        ]
+    }
+    fn state() -> InputState {
+        InputState::new(12, (0.0, 1000.0, 0.0, 1000.0))
+    }
+    fn has(events: &[InputEvent], kind: InputEventKind, value: i32) -> bool {
+        events
+            .iter()
+            .any(|e| e.kind() == kind && e.value() == value)
+    }
+    #[test]
+    fn center_is_forwarded_while_edge_group_is_hidden() {
+        let mut s = state();
+        let c = Config::default();
+        let (output, _) = s.frame(&start(7, 10, 500, 500), 0, &c);
+        assert!(has(
+            &output,
+            InputEventKind::AbsAxis(Axis::ABS_MT_TRACKING_ID),
+            10
+        ));
+        assert!(has(&output, InputEventKind::Key(Key::BTN_TOOL_FINGER), 1));
+        let (output, _) = s.frame(&start(0, 11, 10, 500), 20, &c);
+        assert!(!has(
+            &output,
+            InputEventKind::AbsAxis(Axis::ABS_MT_TRACKING_ID),
+            11
+        ));
+        let (output, _) = s.frame(&start(2, 12, 300, 500), 40, &c);
+        assert!(!has(
+            &output,
+            InputEventKind::AbsAxis(Axis::ABS_MT_TRACKING_ID),
+            12
+        ));
+        assert!(!has(
+            &output,
+            InputEventKind::Key(Key::BTN_TOOL_DOUBLETAP),
+            1
+        ));
+        let (output, events) = s.frame(&release(0), 80, &c);
+        assert!(events.is_empty());
+        assert!(!has(&output, InputEventKind::Key(Key::BTN_TOUCH), 0));
+        s.frame(&release(2), 100, &c);
+        let (output, _) = s.frame(&release(7), 120, &c);
+        assert!(has(
+            &output,
+            InputEventKind::AbsAxis(Axis::ABS_MT_TRACKING_ID),
+            -1
+        ));
+        assert!(has(&output, InputEventKind::Key(Key::BTN_TOUCH), 0));
+    }
+    #[test]
+    fn current_slot_is_explicit_even_after_hidden_slot_changes() {
+        let mut s = state();
+        let c = Config::default();
+        s.frame(&start(0, 1, 10, 500), 0, &c);
+        s.frame(&start(9, 2, 500, 500), 100, &c);
+        s.frame(
+            &[abs(Axis::ABS_MT_SLOT, 0), abs(Axis::ABS_MT_POSITION_Y, 400)],
+            110,
+            &c,
+        );
+        let (out, _) = s.frame(
+            &[abs(Axis::ABS_MT_SLOT, 9), abs(Axis::ABS_MT_POSITION_X, 550)],
+            120,
+            &c,
+        );
+        assert!(has(
+            &out[..1],
+            InputEventKind::AbsAxis(Axis::ABS_MT_SLOT),
+            9
+        ));
+        let (out, _) = s.frame(&[abs(Axis::ABS_MT_POSITION_X, 600)], 130, &c);
+        assert!(has(
+            &out[..1],
+            InputEventKind::AbsAxis(Axis::ABS_MT_SLOT),
+            9
+        ));
+        assert!(has(&out, InputEventKind::AbsAxis(Axis::ABS_X), 600));
+    }
+    #[test]
+    fn released_frame_coordinates_and_slot_reuse() {
+        let mut s = state();
+        let c = Config::default();
+        s.frame(&start(0, 1, 10, 700), 0, &c);
+        let mut end = vec![abs(Axis::ABS_MT_POSITION_Y, 400)];
+        end.extend(release(0));
+        let (_, events) = s.frame(&end, 100, &c);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].gesture, Gesture::SwipeUp);
+        let (out, _) = s.frame(&start(0, 2, 500, 500), 150, &c);
+        assert!(has(
+            &out,
+            InputEventKind::AbsAxis(Axis::ABS_MT_TRACKING_ID),
+            2
+        ));
+        let (out, _) = s.frame(&start(0, 3, 550, 550), 160, &c);
+        assert!(has(
+            &out,
+            InputEventKind::AbsAxis(Axis::ABS_MT_TRACKING_ID),
+            -1
+        ));
+        assert!(has(
+            &out,
+            InputEventKind::AbsAxis(Axis::ABS_MT_TRACKING_ID),
+            3
+        ));
+    }
+    #[test]
+    fn replacing_edge_contact_in_one_frame_starts_a_new_gesture() {
+        let mut s = state();
+        let c = Config::default();
+        s.frame(&start(0, 1, 10, 500), 0, &c);
+        let (out, first) = s.frame(&start(0, 2, 10, 500), 100, &c);
+        assert!(out.is_empty());
+        assert_eq!(first.len(), 1);
+        let (out, second) = s.frame(&release(0), 150, &c);
+        assert!(out.is_empty());
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].gesture, Gesture::Tap);
+    }
+
+    #[test]
+    fn reset_releases_all_forwarded_contacts_and_cancels_gestures() {
+        let mut s = state();
+        let c = Config::default();
+        s.frame(&start(0, 1, 500, 500), 0, &c);
+        s.frame(&start(1, 2, 600, 500), 10, &c);
+        s.frame(&start(2, 3, 10, 500), 20, &c);
+        let out = s.reset();
+        assert_eq!(
+            out.iter()
+                .filter(
+                    |e| e.kind() == InputEventKind::AbsAxis(Axis::ABS_MT_TRACKING_ID)
+                        && e.value() == -1
+                )
+                .count(),
+            2
+        );
+        assert!(has(&out, InputEventKind::Key(Key::BTN_TOOL_DOUBLETAP), 0));
+        assert!(has(&out, InputEventKind::Key(Key::BTN_TOUCH), 0));
+        assert!(s.tick(600, &c).is_empty());
+    }
+    #[test]
+    fn incomplete_coordinates_and_invalid_slots_are_not_forwarded() {
+        let mut s = state();
+        let c = Config::default();
+        let (out, _) = s.frame(
+            &[
+                abs(Axis::ABS_MT_TRACKING_ID, 1),
+                abs(Axis::ABS_MT_POSITION_X, 10),
+            ],
+            0,
+            &c,
+        );
+        assert!(out.is_empty());
+        let (out, _) = s.frame(&[abs(Axis::ABS_MT_POSITION_Y, 500)], 10, &c);
+        assert!(out.is_empty());
+        s.frame(&start(100, 2, 500, 500), 20, &c);
+        assert_eq!(s.contacts().len(), 1);
+    }
 }
