@@ -2,7 +2,7 @@
 
 Bezel turns the edges of your Linux trackpad into a configurable control surface. Bind **1–4 fingers** independently: use one finger on the left edge for volume, two for brightness, and three for workspace controls.
 
-https://github.com/user-attachments/assets/4d8f579b-9d4f-4b18-b5a2-782e4274a8da
+https://github.com/user-attachments/assets/f56bbd12-6394-4726-b41b-ba38439b61e5
 
 **New in [v1.0.0](https://github.com/Indra55/bezel/releases/tag/v1.0.0):**
 
