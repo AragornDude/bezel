@@ -65,3 +65,38 @@ enabled = false
 backend = "notify-send" # options: "notify-send", "swayosd", "pipe"
 canonical_hints = false # set to true if using mako or notify-osd
 # pipe_path = "/tmp/bezel-osd" # only if backend is "pipe"
+
+# Shared recognition defaults. Distances are fractions of each trackpad axis.
+[recognition]
+join_ms = 80
+swipe_distance = 0.05
+tap_distance = 0.02
+tap_ms = 200
+double_tap_ms = 300
+hold_ms = 500
+step_distance = 0.03
+
+# Optional multi-finger bindings. Uncomment to enable.
+# The first finger starts at the edge; other fingers join within join_ms.
+# [[bindings]]
+# zone = "left"
+# fingers = 2
+# gesture = "slide_up"
+# action = "command"
+# cmd = "wpctl set-volume @DEFAULT_SINK@ 2%+"
+# step_distance = 0.03
+
+# [[bindings]]
+# zone = "left"
+# fingers = 2
+# gesture = "slide_down"
+# action = "command"
+# cmd = "wpctl set-volume @DEFAULT_SINK@ 2%-"
+
+# [[bindings]]
+# zone = "bottom"
+# fingers = 3
+# gesture = "hold"
+# action = "command"
+# cmd = "playerctl play-pause"
+# hold_ms = 600

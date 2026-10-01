@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use evdev::{
+    raw_stream::RawDevice,
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    Device,
 };
 use tracing::info;
 
-pub fn create_virtual_device(real_device: &Device) -> Result<VirtualDevice> {
+pub fn create_virtual_device(real_device: &RawDevice) -> Result<VirtualDevice> {
     let mut keys = evdev::AttributeSet::new();
     // Copy all keys from the real device
     if let Some(real_keys) = real_device.supported_keys() {
@@ -18,7 +18,7 @@ pub fn create_virtual_device(real_device: &Device) -> Result<VirtualDevice> {
     builder = builder.input_id(real_device.input_id());
 
     if let Some(real_keys) = real_device.supported_keys() {
-        builder = builder.with_keys(&real_keys)?;
+        builder = builder.with_keys(real_keys)?;
     }
 
     if let Some(real_abs) = real_device.supported_absolute_axes() {
@@ -40,16 +40,16 @@ pub fn create_virtual_device(real_device: &Device) -> Result<VirtualDevice> {
     }
 
     if let Some(real_rel) = real_device.supported_relative_axes() {
-        builder = builder.with_relative_axes(&real_rel)?;
+        builder = builder.with_relative_axes(real_rel)?;
     }
 
     if let Some(real_switches) = real_device.supported_switches() {
-        builder = builder.with_switches(&real_switches)?;
+        builder = builder.with_switches(real_switches)?;
     }
 
     let props = real_device.properties();
     if props.iter().next().is_some() {
-        builder = builder.with_properties(&props)?;
+        builder = builder.with_properties(props)?;
     }
 
     let virtual_device = builder

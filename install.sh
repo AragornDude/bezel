@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-echo "--- Bezel Smart Installer ---"
+install_accent='' install_muted='' install_reset=''
+if [ -t 2 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
+    install_accent=$'\033[38;2;199;139;95m'
+    install_muted=$'\033[38;2;161;115;83m'
+    install_reset=$'\033[0m'
+fi
+install_current=''
+install_stage() {
+    if [ -n "$install_current" ]; then
+        printf '  %b✓ %s%b\n' "$install_muted" "$install_current" "$install_reset" >&2
+    fi
+    install_current="$2"
+    printf '\n%b%02d / 06  %s%b\n' "$install_accent" "$1" "$2" "$install_reset" >&2
+}
+printf '\n%bB E Z E L%b  /  INSTALL\n' "$install_accent" "$install_reset" >&2
+printf 'Your trackpad, tuned to you.\n' >&2
 
 INSTALL_MODE="unknown"
 NEEDS_RELOGIN=0
@@ -59,13 +74,13 @@ else
 fi
 
 if [ "$INSTALL_MODE" = "source" ]; then
-    echo "[1/6] Local source detected. Building Bezel binary from source..."
+    install_stage 1 "Build from local source"
     if ! command -v cargo &> /dev/null; then
         echo "Error: Rust/Cargo not found. Install from https://rustup.rs"
         exit 1
     fi
     cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
-    echo "[2/6] Installing binary to ~/.local/bin/bezel..."
+    install_stage 2 "Install binary"
     mkdir -p ~/.local/bin
     if [ -f "$BIN_DEST" ]; then
         echo "      Backing up existing binary to $BIN_DEST.bak"
@@ -75,7 +90,7 @@ if [ "$INSTALL_MODE" = "source" ]; then
     cp "$SCRIPT_DIR/target/release/bezel" ~/.local/bin/
     BIN_DEST="$HOME/.local/bin/bezel"
 else
-    echo "[1/6] Fetching latest release info..."
+    install_stage 1 "Find latest release"
     REMOTE_VERSION=$(curl -w "%{url_effective}\n" -I -L -s -S "$REPO_URL/releases/latest" -o /dev/null | awk -F '/' '{print $NF}')
 
     if [ "$LOCAL_VERSION" != "none" ]; then
@@ -88,7 +103,7 @@ else
         echo "      Installing version $REMOTE_VERSION..."
     fi
 
-    echo "[2/6] Downloading prebuilt Bezel binary..."
+    install_stage 2 "Download and install binary"
     mkdir -p ~/.local/bin
 
     if [ -f "$BIN_DEST" ]; then
@@ -118,7 +133,7 @@ if [[ ":$PATH:" != *":$(dirname "$BIN_DEST"):"* ]]; then
 fi
 
 # 3. Generate a desktop-specific config or offer to reconfigure on upgrades.
-echo "[3/6] Configuring gestures..."
+install_stage 3 "Tune your gestures"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bezel/config.toml"
 if [ -e "$CONFIG_FILE" ] || [ -L "$CONFIG_FILE" ]; then
     if { : </dev/tty; } 2>/dev/null; then
@@ -139,7 +154,7 @@ else
 fi
 
 # 4. Setup Udev rules
-echo "[4/6] Setting up udev rules for /dev/uinput..."
+install_stage 4 "Configure input access"
 echo "      (You may be prompted for your sudo password)"
 if [ -e /etc/udev/rules.d/99-uinput.rules ]; then
     echo "      Existing 99-uinput.rules left untouched; review it if uinput permissions fail."
@@ -151,7 +166,7 @@ EOF
 sudo udevadm control --reload-rules && sudo udevadm trigger --action=add --subsystem-match=input
 
 # 5. Check Input Group
-echo "[5/6] Checking input group permissions..."
+install_stage 5 "Check permissions"
 if ! groups "$USER" | grep -q "\binput\b"; then
     echo "      Adding $USER to the 'input' group..."
     sudo usermod -aG input "$USER"
@@ -162,7 +177,7 @@ else
 fi
 
 # 6. Setup Systemd Service
-echo "[6/6] Configuring background service..."
+install_stage 6 "Set up background service"
 mkdir -p ~/.config/systemd/user/
 SERVICE_TARGET=default.target
 SERVICE_PART_OF=
@@ -198,7 +213,8 @@ if [ "$NEEDS_RELOGIN" -eq 0 ]; then
 fi
 
 echo ""
-echo "--- Install Complete ---"
+printf '  %b✓ %s%b\n' "$install_muted" "$install_current" "$install_reset" >&2
+printf '\n%bSETUP COMPLETE%b\n' "$install_accent" "$install_reset" >&2
 if [ "$NEEDS_RELOGIN" -eq 1 ]; then
     echo "WARNING: You were just added to the 'input' group."
     echo "You MUST reboot your computer for permissions to apply."
