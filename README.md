@@ -1,14 +1,15 @@
 # Bezel
 
-Bezel is a Linux daemon that provides customizable trackpad edge gestures.
-It intercepts raw trackpad inputs via evdev and dispatches shell
-commands based on directional swipes or taps along the edges (zones) of your trackpad.
+Bezel turns the edges of your Linux trackpad into a configurable control surface. Bind **1–4 fingers** independently: use one finger on the left edge for volume, two for brightness, and three for workspace controls.
 
-<p align="center">
-  <img width="700" src="preview.gif" alt="Bezel Demo">
-</p>
+[Watch the Bezel teaser](https://hitanshu.xyz/videos/bezel-teaser.mp4)
 
-<br clear="right">
+**New in [v1.0.0](https://github.com/Indra55/bezel/releases/tag/v1.0.0):**
+
+- Taps, double taps, holds, eight swipe directions, and repeating slides.
+- Gesture Studio: a warm retro terminal wizard with desktop logos and contextual previews.
+- 30 action presets, custom commands, and shared or per-binding sensitivity settings.
+- NixOS setup with declarative output, plus backward-compatible one-finger configuration.
 
 ## Installation
 
@@ -27,7 +28,7 @@ cargo install --git https://github.com/indra55/bezel
 
 ### Arch Linux
 
-Normally we'd just tell you to `yay -S bezel`, but the AUR is currently experiencing a massive malware apocalypse. Someone adopted 1,500 orphaned packages and turned them into malware, so Arch had to disable new account registrations. We have our `PKGBUILD` ready to go, but until they put out the fire, you'll have to use the prebuilt binary or build from source like a normal person. Stay safe out there!
+Use the prebuilt installer or build from source with Cargo.
 
 ### NixOS
 You can try out Bezel using this command:
@@ -114,9 +115,21 @@ Then reload udev rules with `sudo udevadm control --reload-rules && sudo udevadm
 ### Configuration
 Bezel looks for its configuration at `~/.config/bezel/config.toml`.
 
-On first install, `install.sh` launches a terminal onboarding wizard. It detects your Wayland desktop, offers numbered choices for Hyprland, Niri, Sway, Plasma, GNOME, other Wayland desktops, or NixOS, and shows each trackpad edge as you configure it. In the panel, customizing an edge lets you choose 1–4 fingers, then a gesture and action, with up to 30 action presets plus custom shell commands. Window controls adapt to Hyprland, Niri, and Sway; utility presets appear when their required tools are installed. Press Enter to keep suggested bindings, or customize each edge, including multi-finger bindings. Hyprland, Niri, and Sway get their own workspace commands; Plasma, GNOME, and unknown desktops omit workspace actions. On upgrades, the installer asks whether to run onboarding again when a config exists. Choosing no keeps the config. Choosing yes opens the wizard, where **Apply now** backs up and replaces it, while **Save preview only** leaves it unchanged.
+On first install, `install.sh` opens **Gesture Studio**. Choose your desktop, then **Customize this edge → finger count → gesture → action**. Assign different controls to the same edge, keep the suggestions with Enter, or clear an edge. Hyprland, Niri, Sway, KDE Plasma, GNOME, and NixOS have logo previews; choosing NixOS asks for your compositor next.
 
-The active trackpad edge uses a static warm-orange halo in color terminals. If your shell sets `NO_COLOR`, run `bash onboard.sh --color` to preview the accent anyway; `--no-color` forces the monochrome version.
+Use arrow keys or type a number, then press Enter. Escape goes back while preserving your choices. Action menus show eight entries per page; keep scrolling or enter an action number directly. Press R to replay an illustrated gesture preview. Optional tuning defaults to Done, so you can skip it with Enter.
+
+The panel uses warm amber accents and previews that match the current step. It needs a UTF-8 terminal at least 80 columns × 24 rows; other terminals use numbered prompts. Terminal state is restored on exit, and shrinking the window switches to the numbered fallback.
+
+To configure a cloned checkout again:
+
+```sh
+bash onboard.sh
+```
+
+Use `--plain` for numbered prompts, `--no-animation` to disable gesture animation, `--no-color` for monochrome, or `--color` to enable accents despite `NO_COLOR`. The plain flow offers basic per-edge choices followed by an advanced multi-finger binding editor.
+
+On upgrades, the installer asks whether to run onboarding again. Existing configurations are kept unless you choose **Apply configuration**, which creates a backup. **Save preview only** writes a separate preview, and Cancel leaves your configuration untouched.
 
 On NixOS, the installer prints a Home Manager snippet instead of creating an unmanaged TOML file or systemd service. Import the Bezel Home Manager module, add the snippet, and configure `hardware.uinput` plus the `input` and `uinput` groups in your NixOS configuration. The snippet includes the gesture command tools (`wpctl`, `brightnessctl`, `playerctl`).
 
@@ -143,6 +156,32 @@ canonical_hints = false # Set to true only if using mako or notify-osd
 **NixOS Users:** After importing the Home Manager module you can also customize Bezel using the `services.bezel.config` option. See `config.nix.example` for a complete template.
 
 ### Multi-finger gestures
+
+For one-finger volume and two-finger brightness on the **same left edge**:
+
+```toml
+[gestures.left.up]
+action = "command"
+cmd = "wpctl set-volume @DEFAULT_SINK@ 5%+"
+
+[gestures.left.down]
+action = "command"
+cmd = "wpctl set-volume @DEFAULT_SINK@ 5%-"
+
+[[bindings]]
+zone = "left"
+fingers = 2
+gesture = "swipe_up"
+action = "command"
+cmd = "brightnessctl set 10%+"
+
+[[bindings]]
+zone = "left"
+fingers = 2
+gesture = "swipe_down"
+action = "command"
+cmd = "brightnessctl set 10%-"
+```
 
 Legacy `[gestures.edge.direction]` entries bind one finger. Use `[[bindings]]` for **1–4 fingers**, with `zone`, `fingers`, `gesture`, `action = "command"`, and `cmd`:
 
@@ -180,7 +219,34 @@ Set shared defaults in `[recognition]`. Distances are fractions of the trackpad 
 
 Distances accept 0.001–1; times accept 1–10000 ms (`join_ms`: 1–1000), with joining time no greater than tap/hold time. Explicit bindings override equivalent legacy entries; duplicate explicit bindings and incompatible overrides are rejected. Valid config reloads affect the next gesture; invalid reloads retain the previous configuration.
 
-Run `bash onboard.sh` and choose **Customize this edge → finger count → gesture → action**. You can assign one-finger volume and two-finger brightness on the same edge. The plain fallback also provides a separate advanced binding editor. It supports 30 action presets, custom shell commands (option 31), shared sensitivity, and TOML or Nix output. New presets include close/fullscreen/floating, directional window focus, launcher, terminal, lock, screenshots, clipboard history, and Do Not Disturb. Utility choices detect installed tools: fuzzel/wofi/rofi, common terminals, hyprlock/swaylock/loginctl, grim + slurp + wl-copy (or Niri screenshots), cliphist + a picker + wl-copy, and swaync/dunst. Clipboard history requires an existing cliphist capture service; screenshots from grim are copied to the clipboard. Nix users should add the tools they select to their packages. Preview, backup, and cancel work as before. See [config.toml.example](config.toml.example) and [config.nix.example](config.nix.example).
+Pinch/zoom and double-tap swipes are not implemented. Multi-finger recognition requires independent **type-B multitouch slots**; devices that only report an aggregate finger count are unsupported. Input overflow cancels pending gestures and waits for contacts to lift. Normal center contacts remain available through Bezel's virtual trackpad.
+
+### Action presets
+
+Gesture Studio offers up to **30 presets**, with **31** reserved for a custom shell command. The original preset numbers 1–16 are unchanged. Available actions depend on your compositor and installed tools.
+
+| Numbers | Actions |
+| --- | --- |
+| 1–3, 11 | Volume up/down, mute speakers, mute microphone |
+| 4–5 | Brightness up/down |
+| 6–10 | Play/pause, next/previous track, seek forward/backward 10 seconds |
+| 12–15 | Previous/next workspace, move window to previous/next workspace |
+| 16 | Toggle Hyprland magic workspace |
+| 17–19 | Close focused window, toggle fullscreen, toggle floating |
+| 20–23 | Focus window left/right/up/down |
+| 24 | Open application launcher |
+| 25 | Open terminal |
+| 26 | Lock screen |
+| 27–28 | Screenshot selected region or entire screen |
+| 29 | Open clipboard history |
+| 30 | Toggle Do Not Disturb |
+| 31 | Custom shell command |
+
+Window and workspace presets use commands for Hyprland, Niri, or Sway. Hyprland presets use the Lua dispatcher syntax for 0.55+; older releases can use custom commands. Plasma, GNOME, and generic desktops omit unsupported window/workspace choices.
+
+Utility presets detect fuzzel/wofi/rofi, common terminals, hyprlock/swaylock/loginctl, grim + slurp + wl-copy (or Niri's screenshot UI), cliphist + a picker + wl-copy, and swaync/dunst. grim screenshots are copied to the clipboard; Niri screenshots use Niri's configured saving behavior. Clipboard history needs an existing cliphist capture service. Nix users should add the tools they select to their packages.
+
+See [config.toml.example](config.toml.example) and [config.nix.example](config.nix.example) for templates.
 
 ### Autostart
 
