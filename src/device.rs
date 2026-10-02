@@ -50,16 +50,16 @@ pub fn find_device_by_name(target_name: &str) -> Result<RawDevice> {
         if let Ok(device) = RawDevice::open(&path) {
             if let Some(name) = device.name() {
                 if name == target_name {
-                    info!(
-                        "Found device by name: {} at {:?}",
-                        name, path
-                    );
+                    info!("Found device by name: {} at {:?}", name, path);
                     return Ok(device);
                 }
             }
         }
     }
-    bail!("No device found with name: '{}'. Check your spelling or run `sudo libinput list-devices`.", target_name);
+    bail!(
+        "No device found with name: '{}'. Check your spelling or run `sudo libinput list-devices`.",
+        target_name
+    );
 }
 
 #[derive(Clone, Default)]
