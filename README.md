@@ -1,14 +1,15 @@
 # Bezel
 
-Bezel is a Linux daemon that provides customizable trackpad edge gestures.
-It intercepts raw trackpad inputs via evdev and dispatches shell
-commands based on directional swipes or taps along the edges (zones) of your trackpad.
+Bezel turns the edges of your Linux trackpad into a configurable control surface. Bind **1–4 fingers** independently: use one finger on the left edge for volume, two for brightness, and three for workspace controls.
 
-<p align="center">
-  <img width="700" src="preview.gif" alt="Bezel Demo">
-</p>
+https://github.com/user-attachments/assets/f56bbd12-6394-4726-b41b-ba38439b61e5
 
-<br clear="right">
+**New in [v1.0.0](https://github.com/Indra55/bezel/releases/tag/v1.0.0):**
+
+- Taps, double taps, holds, eight swipe directions, and repeating slides.
+- Gesture Studio: a warm retro terminal wizard with desktop logos and contextual previews.
+- 30 action presets, custom commands, and shared or per-binding sensitivity settings.
+- NixOS setup with declarative output, plus backward-compatible one-finger configuration.
 
 ## Installation
 
@@ -27,7 +28,7 @@ cargo install --git https://github.com/indra55/bezel
 
 ### Arch Linux
 
-Normally we'd just tell you to `yay -S bezel`, but the AUR is currently experiencing a massive malware apocalypse. Someone adopted 1,500 orphaned packages and turned them into malware, so Arch had to disable new account registrations. We have our `PKGBUILD` ready to go, but until they put out the fire, you'll have to use the prebuilt binary or build from source like a normal person. Stay safe out there!
+Use the prebuilt installer or build from source with Cargo.
 
 ### NixOS
 You can try out Bezel using this command:
@@ -76,12 +77,14 @@ If you prefer to enable Bezel per-user instead, you can do so using Home Manager
 ```nix
 { inputs, ... }: {
   imports = [
-    inputs.bezel.homeManagerModules.default
+    inputs.bezel.homeModules.default
   ];
 
   services.bezel.enable = true;
 }
 ```
+
+`homeManagerModules.default` remains available for existing configurations.
 
 **NOTE:** If you use the Home Manager module, you'll have to enable uinput separately in your NixOS config, as Home Manager doesn't have access to them:
 ```nix
@@ -112,13 +115,35 @@ Then reload udev rules with `sudo udevadm control --reload-rules && sudo udevadm
 ### Configuration
 Bezel looks for its configuration at `~/.config/bezel/config.toml`.
 
+On first install, `install.sh` opens **Gesture Studio**. Choose your desktop, then **Customize this edge → finger count → gesture → action**. Assign different controls to the same edge, keep the suggestions with Enter, or clear an edge. Hyprland, Niri, Sway, KDE Plasma, GNOME, and NixOS have logo previews; choosing NixOS asks for your compositor next.
+
+Use arrow keys or type a number, then press Enter. Escape goes back while preserving your choices. Action menus show eight entries per page; keep scrolling or enter an action number directly. Press R to replay an illustrated gesture preview. Optional tuning defaults to Done, so you can skip it with Enter.
+
+The panel uses warm amber accents and previews that match the current step. It needs a UTF-8 terminal at least 80 columns × 24 rows; other terminals use numbered prompts. Terminal state is restored on exit, and shrinking the window switches to the numbered fallback.
+
+To configure a cloned checkout again:
+
+```sh
+bash onboard.sh
+```
+
+Use `--plain` for numbered prompts, `--no-animation` to disable gesture animation, `--no-color` for monochrome, or `--color` to enable accents despite `NO_COLOR`. The plain flow offers basic per-edge choices followed by an advanced multi-finger binding editor.
+
+On upgrades, the installer asks whether to run onboarding again. Existing configurations are kept unless you choose **Apply configuration**, which creates a backup. **Save preview only** writes a separate preview, and Cancel leaves your configuration untouched.
+
+On NixOS, the installer prints a Home Manager snippet instead of creating an unmanaged TOML file or systemd service. Import the Bezel Home Manager module, add the snippet, and configure `hardware.uinput` plus the `input` and `uinput` groups in your NixOS configuration. The snippet includes the gesture command tools (`wpctl`, `brightnessctl`, `playerctl`).
+
+For Arch, Debian/Ubuntu, Fedora, and openSUSE, the same installer uses systemd user services and udev; you need Rust only when building from source or when a prebuilt binary is unavailable. The command tools above must be installed separately.
+
 To define a gesture, specify the zone and direction, and the command to run:
+This example uses Hyprland 0.55+ syntax; older Hyprland releases use different dispatch commands.
+
 ```toml
 [gestures.top.left]
 action = "command"
-cmd = "hyprctl dispatch workspace e-1"
+cmd = "hyprctl dispatch 'hl.dsp.focus({ workspace = \"e-1\" })'"
 ```
-*(See `config.toml.example` in this repo for a complete template).*
+*(See `config.toml.example` in this repo for a basic template.)*
 
 To configure OSD labels, add the following:
 ```toml
@@ -130,6 +155,99 @@ canonical_hints = false # Set to true only if using mako or notify-osd
 
 **NixOS Users:** After importing the Home Manager module you can also customize Bezel using the `services.bezel.config` option. See `config.nix.example` for a complete template.
 
+### Multi-finger gestures
+
+For one-finger volume and two-finger brightness on the **same left edge**:
+
+```toml
+[gestures.left.up]
+action = "command"
+cmd = "wpctl set-volume @DEFAULT_SINK@ 5%+"
+
+[gestures.left.down]
+action = "command"
+cmd = "wpctl set-volume @DEFAULT_SINK@ 5%-"
+
+[[bindings]]
+zone = "left"
+fingers = 2
+gesture = "swipe_up"
+action = "command"
+cmd = "brightnessctl set 10%+"
+
+[[bindings]]
+zone = "left"
+fingers = 2
+gesture = "swipe_down"
+action = "command"
+cmd = "brightnessctl set 10%-"
+```
+
+Legacy `[gestures.edge.direction]` entries bind one finger. Use `[[bindings]]` for **1–4 fingers**, with `zone`, `fingers`, `gesture`, `action = "command"`, and `cmd`:
+
+```toml
+[[bindings]]
+zone = "left"
+fingers = 2
+gesture = "slide_up"
+action = "command"
+cmd = "wpctl set-volume @DEFAULT_SINK@ 2%+"
+step_distance = 0.03
+```
+
+Start one finger at an edge, then add the others within **80 ms** (`join_ms`); they may start inside the pad. Existing center touches stay independent. One edge gesture runs at a time, and contacts arriving after the joining window pass through normally. The selected edge and finger count remain fixed until release. Unconfigured counts do not fall back to one-finger commands; gesture contacts remain reserved until lifted. More than four joining contacts cancel the gesture. Your trackpad must report each contact independently using multitouch slots.
+
+Available gestures:
+
+- `tap`, `double_tap`, `hold`.
+- `swipe_up`, `swipe_down`, `swipe_left`, `swipe_right`, and `swipe_up_left`, `swipe_up_right`, `swipe_down_left`, `swipe_down_right`.
+- `slide_up`, `slide_down`, `slide_left`, `slide_right`: repeat the command for each movement step, with direction reversal supported.
+
+Swipes fire once when all participating fingers lift. Holds fire once while fingers remain down. Slides and holds suppress release gestures. Diagonal bindings apply within 22.5° of their diagonal; otherwise Bezel uses the dominant cardinal direction. Single taps are delayed only when a double tap is bound for the same edge/count; both taps must finish within the double-tap interval and start close together.
+
+Set shared defaults in `[recognition]`. Distances are fractions of the trackpad axes, not physical millimeters:
+
+| Setting | Default | Per-binding override |
+| --- | --- | --- |
+| `join_ms` | 80 | Shared only |
+| `swipe_distance` | 0.05 | Swipes |
+| `tap_distance` | 0.02 | Taps and holds |
+| `tap_ms` | 200 | Taps and double taps |
+| `double_tap_ms` | 300 | Double taps |
+| `hold_ms` | 500 | Holds |
+| `step_distance` | 0.03 | Slides |
+
+Distances accept 0.001–1; times accept 1–10000 ms (`join_ms`: 1–1000), with joining time no greater than tap/hold time. Explicit bindings override equivalent legacy entries; duplicate explicit bindings and incompatible overrides are rejected. Valid config reloads affect the next gesture; invalid reloads retain the previous configuration.
+
+Pinch/zoom and double-tap swipes are not implemented. Multi-finger recognition requires independent **type-B multitouch slots**; devices that only report an aggregate finger count are unsupported. Input overflow cancels pending gestures and waits for contacts to lift. Normal center contacts remain available through Bezel's virtual trackpad.
+
+### Action presets
+
+Gesture Studio offers up to **30 presets**, with **31** reserved for a custom shell command. The original preset numbers 1–16 are unchanged. Available actions depend on your compositor and installed tools.
+
+| Numbers | Actions |
+| --- | --- |
+| 1–3, 11 | Volume up/down, mute speakers, mute microphone |
+| 4–5 | Brightness up/down |
+| 6–10 | Play/pause, next/previous track, seek forward/backward 10 seconds |
+| 12–15 | Previous/next workspace, move window to previous/next workspace |
+| 16 | Toggle Hyprland magic workspace |
+| 17–19 | Close focused window, toggle fullscreen, toggle floating |
+| 20–23 | Focus window left/right/up/down |
+| 24 | Open application launcher |
+| 25 | Open terminal |
+| 26 | Lock screen |
+| 27–28 | Screenshot selected region or entire screen |
+| 29 | Open clipboard history |
+| 30 | Toggle Do Not Disturb |
+| 31 | Custom shell command |
+
+Window and workspace presets use commands for Hyprland, Niri, or Sway. Hyprland presets use the Lua dispatcher syntax for 0.55+; older releases can use custom commands. Plasma, GNOME, and generic desktops omit unsupported window/workspace choices.
+
+Utility presets detect fuzzel/wofi/rofi, common terminals, hyprlock/swaylock/loginctl, grim + slurp + wl-copy (or Niri's screenshot UI), cliphist + a picker + wl-copy, and swaync/dunst. grim screenshots are copied to the clipboard; Niri screenshots use Niri's configured saving behavior. Clipboard history needs an existing cliphist capture service. Nix users should add the tools they select to their packages.
+
+See [config.toml.example](config.toml.example) and [config.nix.example](config.nix.example) for templates.
+
 ### Autostart
 
 > [!WARNING]  
@@ -137,7 +255,14 @@ canonical_hints = false # Set to true only if using mako or notify-osd
 
 Start Bezel when your Wayland compositor starts. **Void Linux / non-systemd** users should use this method instead of a background service. If `bezel` is not in your system `$PATH`, use the absolute path `~/.local/bin/bezel` (or `~/.cargo/bin/bezel` if built with cargo).
 
-For **Hyprland** (`~/.config/hypr/hyprland.conf`):
+For **Hyprland 0.55+** (`~/.config/hypr/hyprland.lua`):
+```lua
+hl.on("hyprland.start", function()
+    hl.exec_cmd("~/.local/bin/bezel")
+end)
+```
+
+For **older Hyprland** (`~/.config/hypr/hyprland.conf`):
 ```conf
 exec-once = ~/.local/bin/bezel
 ```
@@ -187,7 +312,14 @@ If OSD notifications (`notify-send`) fail or don't show up when Bezel is run as 
 
 To fix this, add the following to your compositor's startup config to import the session variables:
 
-**Hyprland:**
+**Hyprland 0.55+** (`hyprland.lua`):
+```lua
+hl.on("hyprland.start", function()
+    hl.exec_cmd("systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS")
+end)
+```
+
+**Older Hyprland** (`hyprland.conf`):
 ```conf
 exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS
 ```
@@ -197,40 +329,25 @@ exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESK
 exec systemctl --user import-environment WAYLAND_DISPLAY SWAYSOCK DBUS_SESSION_BUS_ADDRESS
 ```
 *(Niri does this automatically).*
-### Bezel is Intercepting the Wrong Device (e.g., Touchscreens)
+### Bezel is Intercepting the Wrong Device
 
-Because Bezel intercepts raw inputs via evdev, its auto-detection heuristic might accidentally grab a touchscreen, stylus, or other multi-touch interface instead of your actual trackpad. If Bezel is running but gestures aren't registering, this is likely the cause.
+If Bezel accidentally grabs a touchscreen or stylus instead of your trackpad, you can bypass auto-detection by explicitly defining the trackpad's name in your `~/.config/bezel/config.toml`.
 
-To fix this, you can bypass auto-detection and explicitly define your trackpad's exact name in your `~/.config/bezel/config.toml`.
-
-**Step 1: Find your active trackpad event node**
-Run the following debugging command and physically swipe on your trackpad. Look at the output to see which `eventX` node is actively reacting to your touches. *(Note: On Arch Linux, you may need to install the `libinput-tools` package first).*
-
-```sh
-sudo libinput debug-events
-```
-
-**Step 2: Find the exact device name**
-Once you know the active event node (e.g., `event7`), stop the debugging tool (`Ctrl+C`) and run this command to list all input devices:
-
-```sh
-sudo libinput list-devices
-```
-
-Scroll through the output to find the block where the **Kernel** line matches your active event node (e.g., `/dev/input/event7`). Copy the exact string from the **Device** line (e.g., `PIXA3854:00 093A:0239 Touchpad`).
-
-**Step 3: Update your configuration**
-Add a `[device]` block to the top of your `~/.config/bezel/config.toml` using that exact name:
+You can find your trackpad's exact name by running `sudo libinput list-devices` and copying the string from the **Device** line.
 
 ```toml
 [device]
 path = "PIXA3854:00 093A:0239 Touchpad"
-```
-*(Note: Because Bezel looks up the name dynamically, this method is safe from the dynamic `/dev/input/event*` shuffling that occurs on reboot. The /dev/input/event# path still works, though it is highly discouraged for this reason.).*
 
-Then restart the service for the changes to take effect:
+```
+
+*(Note: Using the device name is recommended over hardcoding a `/dev/input/event*` path, as event numbers change on reboot.)*
+
+Restart the service for the changes to take effect:
+
 ```sh
 systemctl --user restart bezel.service
+
 ```
 ### Debugging Logs
 

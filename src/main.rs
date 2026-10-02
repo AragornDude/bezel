@@ -13,7 +13,7 @@ mod passthrough;
 use config::{get_config_path, load_config};
 use device::run_input_reader;
 use dispatcher::run_dispatcher;
-use gesture::{ActionCommand, GestureEvent};
+use gesture::{ActionCommand, Gesture, GestureEvent};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -76,24 +76,30 @@ async fn main() -> Result<()> {
     }
 
     while let Some(event) = gesture_rx.recv().await {
-        let current_config = config_rx.borrow().clone();
-
-        if let Some(zone_gestures) = current_config.gestures.get(&event.zone) {
-            if let Some(gesture_action) = zone_gestures.get(&event.direction) {
-                if gesture_action.action == "command" {
-                    info!(
-                        "Matched gesture {:?} in zone {:?} (fingers: {}, mag: {:.2}) to command: {}",
-                        event.direction, event.zone, event.finger_count, event.magnitude, gesture_action.cmd
-                    );
-                    let cmd = ActionCommand {
-                        cmd: gesture_action.cmd.clone(),
-                        osd_message: Some(format!("{:?} {:?}", event.zone, event.direction)),
-                    };
-                    let _ = action_tx.send(cmd).await;
-                }
-            }
-        }
+        info!(
+            "Matched {:?} in {:?} (fingers: {}, magnitude: {:.2}) to command: {}",
+            event.gesture, event.zone, event.finger_count, event.magnitude, event.action.cmd
+        );
+        let name = format!("{:?}", event.gesture);
+        let message = if event.finger_count == 1
+            && matches!(
+                event.gesture,
+                Gesture::Tap
+                    | Gesture::SwipeUp
+                    | Gesture::SwipeDown
+                    | Gesture::SwipeLeft
+                    | Gesture::SwipeRight
+            ) {
+            // Preserve the original OSD pipe messages consumed by the visualizer.
+            format!("{:?} {}", event.zone, name.trim_start_matches("Swipe"))
+        } else {
+            format!("{:?} {} ({} fingers)", event.zone, name, event.finger_count)
+        };
+        let cmd = ActionCommand {
+            cmd: event.action.cmd,
+            osd_message: Some(message),
+        };
+        let _ = action_tx.send(cmd).await;
     }
-
     Ok(())
 }
